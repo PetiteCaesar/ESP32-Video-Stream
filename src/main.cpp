@@ -6,21 +6,14 @@
 #include <TFT_eSPI.h>
 
 
-#define THREADED
+// #define THREADED
 
 
 uint8_t content[1] = {0};
 bool rec = false;
 
 WebSocketsServer webSocket = WebSocketsServer(80);
-
 TFT_eSPI tft = TFT_eSPI();
-
-TaskHandle_t drawTask;
-TaskHandle_t networkTask;
-
-bool kickedOff = false;
-
 JPEGDEC jpeg;
 
 struct FrameBuffer{
@@ -84,15 +77,35 @@ struct FrameBuffer{
         bool m_canFree = false;
 };
 
+#ifdef THREADED
+TaskHandle_t drawTask;
+TaskHandle_t networkTask;
+
+bool kickedOff = false;
+
 FrameBuffer decode;
 FrameBuffer draw1;
 FrameBuffer draw2;
+#else
+//dma logic from tft espi example
+uint16_t dmaBuffer1[128*16]; 
+uint16_t dmaBuffer2[128*16]; 
+uint16_t* dmaBufferPtr = dmaBuffer1;
+bool dmaBufferSel = 0;
+#endif
 
 int JPEGDraw(JPEGDRAW *pDraw) {
+    #ifdef THREADED
     decode.WriteSection(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+    #else
+    if (dmaBufferSel) dmaBufferPtr = dmaBuffer2;
+    else dmaBufferPtr = dmaBuffer1;
+    dmaBufferSel = !dmaBufferSel; 
+    tft.pushImageDMA(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels, dmaBufferPtr);
+    #endif
     return 1;
 }
-
+uint32_t lastDisp = 0;
 void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
 
     switch (type) {
@@ -122,36 +135,33 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t lengt
         break;
 
         case WStype_BIN: {
-            // Serial.println("Got bin");
             if(jpeg.openRAM((uint8_t *)payload, length, JPEGDraw)){
                 auto t = millis();
+                #ifdef THREADED
                 if(jpeg.decode(0,0,0)){
                     // Serial.printf("Decode took: %" PRIu32 "\n",millis()-t);
-                    #ifdef THREADED
+                    
                     if(kickedOff) ulTaskNotifyTake(pdTRUE, portMAX_DELAY); //make sure drawing finished
-                    #endif
                     //wait for drawing to complete
                     draw1.CopyBuffer((uint8_t*)decode.GetBuf(), draw1.GetSizeBytes());
                     draw2.CopyBuffer((uint8_t*)decode.GetBuf()+draw1.GetSizeBytes(), draw2.GetSizeBytes());
                     // Serial.println("Copied to draw 1 and 2, give noti");
                     //tell draw task it can start drawing
-                    #ifdef THREADED
                     xTaskNotifyGive(drawTask);
-                    #else
-                    t = millis();
-                    int draw1Height = (int)TFT_WIDTH/2;
-                    tft.pushImage(0,0,TFT_HEIGHT,draw1Height,draw1.GetBuf());
-                    tft.pushImage(0,draw1Height,TFT_HEIGHT,TFT_WIDTH-draw1Height,draw2.GetBuf());
-                    Serial.printf("memcpy + draw: %" PRIu32 "\n",millis()-t);
-                    #endif
+                   
                 }
+                #else
+                tft.startWrite();
+                jpeg.decode(0,0,0);
+                tft.endWrite();
+                #endif
                 jpeg.close();
             }
             webSocket.sendBIN(num, content, 1);
-            //wait to be told it can run
-            // Serial.println("Wait for noti (draw)");
-            
-            // Serial.println("got noti");
+            #ifndef THREADED
+            Serial.printf("Total time took: %" PRIu32 "\n",millis()-lastDisp);
+            lastDisp = millis();
+            #endif
         }
         break;
         case WStype_ERROR:
@@ -164,6 +174,7 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t lengt
     }
 }
 
+#ifdef THREADED
 void drawLoop(void* pvParameters) {
     uint32_t lastDraw = 0;
     for(;;) {
@@ -192,12 +203,13 @@ void networkLoop(void* params){
     }
 }
 
-
+#endif
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
-
+    
+    #ifdef THREADED
     auto avail1 = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     Serial.print("Avail1 DRAM: ");
     Serial.println(avail1);
@@ -217,7 +229,7 @@ void setup() {
     if(!draw2.CreateBuf(TFT_HEIGHT,TFT_WIDTH-draw1Height)){
         Serial.println("Failed to create draw2 buf");
     }
-    
+    #endif
 
 
     tft.init();
@@ -227,6 +239,9 @@ void setup() {
     tft.fillScreen(TFT_RED);
     tft.setSwapBytes(true);
 
+    #ifndef THREADED
+    tft.initDMA();
+    #endif
 
 
     Serial.print("Connecting to network: ");

@@ -66,7 +66,7 @@ while True:
             i+=1
             
         except KeyboardInterrupt:
-            print("KeyboardInterrupt, Attempting to close (please work)")
+            print("KeyboardInterrupt, Attempting to close")
             ws.close()
             break
     except:
